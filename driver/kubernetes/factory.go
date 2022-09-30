@@ -16,15 +16,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-const prioritySupported = 40
-const priorityUnsupported = 80
+const (
+	prioritySupported   = 40
+	priorityUnsupported = 80
+)
 
 func init() {
 	driver.Register(&factory{})
 }
 
-type factory struct {
-}
+type factory struct{}
 
 func (*factory) Name() string {
 	return DriverName
@@ -45,7 +46,7 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	if cfg.KubeClientConfig == nil {
 		return nil, errors.Errorf("%s driver requires kubernetes API access", DriverName)
 	}
-	deploymentName, err := buildxNameToDeploymentName(cfg.Name)
+	k8sName, err := buildxNameToK8sName(cfg.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -68,33 +69,57 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 		clientset:  clientset,
 	}
 
-	deploymentOpt, loadbalance, namespace, err := f.processDriverOpts(deploymentName, namespace, cfg)
+	deploymentOpt, loadbalance, namespace, err := f.processDriverOpts(k8sName, namespace, cfg)
 	if nil != err {
 		return nil, err
 	}
 
-	d.deployment, d.configMaps, err = manifest.NewDeployment(deploymentOpt)
-	if err != nil {
-		return nil, err
+	controllerType, ok := d.DriverOpts["controller"]
+	if !ok {
+		controllerType = "Deployment"
+	}
+	switch controllerType {
+	case "Deployment":
+		deployment, configMaps, err := manifest.NewDeployment(deploymentOpt)
+		if err != nil {
+			return nil, err
+		}
+
+		d.configMaps = configMaps
+		d.minReplicas = deploymentOpt.Replicas
+		d.labelSelector = deployment.Spec.Selector
+
+		d.deploymentClient = clientset.AppsV1().Deployments(namespace)
+		break
+	case "StatefulSet":
+		statefulSet, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
+		if err != nil {
+			return nil, err
+		}
+
+		d.configMaps = configMaps
+		d.minReplicas = deploymentOpt.Replicas
+		d.labelSelector = statefulSet.Spec.Selector
+		// d.statefulSetClient = clientset.AppsV1().StatefulSets(namespace)
+		break
+	default:
+		return nil, errors.Errorf("unsupported controller type %s", controllerType)
 	}
 
-	d.minReplicas = deploymentOpt.Replicas
-
-	d.deploymentClient = clientset.AppsV1().Deployments(namespace)
 	d.podClient = clientset.CoreV1().Pods(namespace)
 	d.configMapClient = clientset.CoreV1().ConfigMaps(namespace)
 
 	switch loadbalance {
 	case LoadbalanceSticky:
 		d.podChooser = &podchooser.StickyPodChooser{
-			Key:        cfg.ContextPathHash,
-			PodClient:  d.podClient,
-			Deployment: d.deployment,
+			Key:       cfg.ContextPathHash,
+			PodClient: d.podClient,
+			Selector:  d.labelSelector,
 		}
 	case LoadbalanceRandom:
 		d.podChooser = &podchooser.RandomPodChooser{
-			PodClient:  d.podClient,
-			Deployment: d.deployment,
+			PodClient: d.podClient,
+			Selector:  d.labelSelector,
 		}
 	}
 	return d, nil
@@ -219,10 +244,10 @@ func (f *factory) AllowsInstances() bool {
 	return true
 }
 
-// buildxNameToDeploymentName converts buildx name to Kubernetes Deployment name.
+// buildxNameToK8sName converts buildx name to Kubernetes Deployment or Statefulset name.
 //
 // eg. "buildx_buildkit_loving_mendeleev0" -> "loving-mendeleev0"
-func buildxNameToDeploymentName(bx string) (string, error) {
+func buildxNameToK8sName(bx string) (string, error) {
 	// TODO: commands.util.go should not pass "buildx_buildkit_" prefix to drivers
 	if !strings.HasPrefix(bx, "buildx_buildkit_") {
 		return "", errors.Errorf("expected a string with \"buildx_buildkit_\", got %q", bx)
