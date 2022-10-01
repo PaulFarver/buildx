@@ -6,6 +6,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/driver/bkimage"
@@ -78,8 +81,9 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	if !ok {
 		controllerType = "Deployment"
 	}
+	d.controller = controllerType
 	switch controllerType {
-	case "Deployment":
+	case "deployment":
 		deployment, configMaps, err := manifest.NewDeployment(deploymentOpt)
 		if err != nil {
 			return nil, err
@@ -87,20 +91,29 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 
 		d.configMaps = configMaps
 		d.minReplicas = deploymentOpt.Replicas
-		d.labelSelector = deployment.Spec.Selector
+		d.labelSelector = &metav1.LabelSelector{
+			MatchLabels: deployment.Spec.Selector.MatchLabels,
+		}
+
+		d.deployment = deployment
 
 		d.deploymentClient = clientset.AppsV1().Deployments(namespace)
 		break
-	case "StatefulSet":
-		statefulSet, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
+	case "statefulset":
+		statefulset, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
 		if err != nil {
 			return nil, err
 		}
 
 		d.configMaps = configMaps
 		d.minReplicas = deploymentOpt.Replicas
-		d.labelSelector = statefulSet.Spec.Selector
-		// d.statefulSetClient = clientset.AppsV1().StatefulSets(namespace)
+		d.labelSelector = &metav1.LabelSelector{
+			MatchLabels: statefulset.Spec.Selector.MatchLabels,
+		}
+
+		d.statefulset = statefulset
+
+		d.statefulsetClient = clientset.AppsV1().StatefulSets(namespace)
 		break
 	default:
 		return nil, errors.Errorf("unsupported controller type %s", controllerType)
@@ -155,13 +168,29 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 				return nil, "", "", err
 			}
 		case "requests.cpu":
-			deploymentOpt.RequestsCPU = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", err
+			}
+			deploymentOpt.RequestsCPU = r
 		case "requests.memory":
-			deploymentOpt.RequestsMemory = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", err
+			}
+			deploymentOpt.RequestsMemory = r
 		case "limits.cpu":
-			deploymentOpt.LimitsCPU = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", err
+			}
+			deploymentOpt.LimitsCPU = r
 		case "limits.memory":
-			deploymentOpt.LimitsMemory = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", err
+			}
+			deploymentOpt.LimitsMemory = r
 		case "rootless":
 			deploymentOpt.Rootless, err = strconv.ParseBool(v)
 			if err != nil {
@@ -182,31 +211,31 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 			deploymentOpt.NodeSelector = s
 		case "tolerations":
 			ts := strings.Split(v, ";")
-			deploymentOpt.Tolerations = []corev1.Toleration{}
+			deploymentOpt.Tolerations = []*applycorev1.TolerationApplyConfiguration{}
+			// deploymentOpt.Tolerations = []corev1.Toleration{}
 			for i := range ts {
 				kvs := strings.Split(ts[i], ",")
 
-				t := corev1.Toleration{}
+				t := applycorev1.Toleration()
 
 				for j := range kvs {
 					kv := strings.Split(kvs[j], "=")
 					if len(kv) == 2 {
 						switch kv[0] {
 						case "key":
-							t.Key = kv[1]
+							t = t.WithKey(kv[1])
 						case "operator":
-							t.Operator = corev1.TolerationOperator(kv[1])
+							t = t.WithOperator(corev1.TolerationOperator(kv[1]))
 						case "value":
-							t.Value = kv[1]
+							t = t.WithValue(kv[1])
 						case "effect":
-							t.Effect = corev1.TaintEffect(kv[1])
+							t = t.WithEffect(corev1.TaintEffect(kv[1]))
 						case "tolerationSeconds":
-							c, err := strconv.Atoi(kv[1])
+							seconds, err := strconv.Atoi(kv[1])
 							if nil != err {
 								return nil, "", "", err
 							}
-							c64 := int64(c)
-							t.TolerationSeconds = &c64
+							t = t.WithTolerationSeconds(int64(seconds))
 						default:
 							return nil, "", "", errors.Errorf("invalid tolaration %q", v)
 						}
@@ -232,6 +261,8 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 			if v != "" {
 				deploymentOpt.Qemu.Image = v
 			}
+		case "controller":
+			break
 		default:
 			return nil, "", "", errors.Errorf("invalid driver option %s for driver %s", k, DriverName)
 		}

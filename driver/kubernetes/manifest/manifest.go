@@ -7,11 +7,13 @@ import (
 
 	"github.com/docker/buildx/util/platformutil"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 
 	// corev1 "k8s.io/api/core/v1"
+	kv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
 	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	appsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1 "k8s.io/client-go/applyconfigurations/meta/v1"
@@ -36,401 +38,186 @@ type DeploymentOpt struct {
 
 	Rootless       bool
 	NodeSelector   map[string]string
-	Tolerations    []corev1.Toleration
-	RequestsCPU    string
-	RequestsMemory string
-	LimitsCPU      string
-	LimitsMemory   string
+	Tolerations    []*corev1.TolerationApplyConfiguration
+	RequestsCPU    resource.Quantity
+	RequestsMemory resource.Quantity
+	LimitsCPU      resource.Quantity
+	LimitsMemory   resource.Quantity
 	Platforms      []v1.Platform
 
-	VolumeSize             string
-	VolumeStorageClassName *string
+	VolumeSize             resource.Quantity
+	VolumeStorageClassName string
 }
 
 const (
-	containerName      = "buildkitd"
-	AnnotationPlatform = "buildx.docker.com/platform"
-	defaultVolumeSize  = "100Gi"
-	apiVersion         = "apps/v1"
-	kind               = "Deployment"
+	containerName                 = "buildkitd"
+	AnnotationPlatform            = "buildx.docker.com/platform"
+	defaultVolumeSize             = "1Gi"
+	defaultVolumeStorageClassName = "hostpath"
 )
 
-func strtp(s string) *string {
-	return &s
-}
-
-func NewDeployment(opt *DeploymentOpt) (d *appsv1.DeploymentApplyConfiguration, c []*corev1.ConfigMapApplyConfiguration, err error) {
+func NewDeployment(opt *DeploymentOpt) (*appsv1.DeploymentApplyConfiguration, []*corev1.ConfigMapApplyConfiguration, error) {
 	labels := map[string]string{
 		"app": opt.Name,
 	}
 	annotations := map[string]string{}
-	replicas := int32(opt.Replicas)
-	privileged := true
-	args := opt.BuildkitFlags
 
 	if len(opt.Platforms) > 0 {
 		annotations[AnnotationPlatform] = strings.Join(platformutil.Format(opt.Platforms), ",")
 	}
-
-	d = &appsv1.DeploymentApplyConfiguration{
-		TypeMetaApplyConfiguration: metav1.TypeMetaApplyConfiguration{
-			APIVersion: strtp(apiVersion),
-			Kind:       strtp(kind),
-		},
-		ObjectMetaApplyConfiguration: &metav1.ObjectMetaApplyConfiguration{
-			Name:        &opt.Name,
-			Namespace:   &opt.Namespace,
-			Labels:      labels,
-			Annotations: annotations,
-		},
-		Spec: &appsv1.DeploymentSpecApplyConfiguration{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelectorApplyConfiguration{
-				MatchLabels: labels,
-			},
-			Template: &corev1.PodTemplateSpecApplyConfiguration{
-				ObjectMetaApplyConfiguration: &metav1.ObjectMetaApplyConfiguration{
-					Labels:      labels,
-					Annotations: annotations,
-				},
-				Spec: &corev1.PodSpecApplyConfiguration{
-					Containers: []corev1.ContainerApplyConfiguration{
-						{
-							Name:  strtp(containerName),
-							Image: &opt.Image,
-							Args:  args,
-							SecurityContext: &corev1.SecurityContextApplyConfiguration{
-								Privileged: &privileged,
-							},
-							ReadinessProbe: &corev1.ProbeApplyConfiguration{
-								HandlerApplyConfiguration: corev1.HandlerApplyConfiguration{
-									Exec: &corev1.ExecActionApplyConfiguration{
-										Command: []string{"buildctl", "debug", "workers"},
-									},
-								},
-							},
-							Resources: corev1.ResourceRequirementsApplyConfiguration{
-								Requests: corev1.ResourceList{},
-								Limits:   corev1.ResourceList{},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	for _, cfg := range splitConfigFiles(opt.ConfigFiles) {
-		cc := &corev1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: corev1.SchemeGroupVersion.String(),
-				Kind:       "ConfigMap",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   opt.Namespace,
-				Name:        opt.Name + "-" + cfg.name,
-				Annotations: annotations,
-			},
-			Data: cfg.files,
-		}
-
-		d.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:      cfg.name,
-			MountPath: path.Join("/etc/buildkit", cfg.path),
-		}}
-
-		d.Spec.Template.Spec.Volumes = []corev1.Volume{{
-			Name: "config",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: cc.Name,
-					},
-				},
-			},
-		}}
-		c = append(c, cc)
-	}
-
-	if opt.Qemu.Install {
-		d.Spec.Template.Spec.InitContainers = []corev1.Container{
-			{
-				Name:  "qemu",
-				Image: opt.Qemu.Image,
-				Args:  []string{"--install", "all"},
-				SecurityContext: &corev1.SecurityContext{
-					Privileged: &privileged,
-				},
-			},
-		}
-	}
-
 	if opt.Rootless {
-		if err := toRootless(d); err != nil {
-			return nil, nil, err
-		}
+		annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
 	}
 
-	if len(opt.NodeSelector) > 0 {
-		d.Spec.Template.Spec.NodeSelector = opt.NodeSelector
-	}
+	configMaps, volumes, mounts := configMaps(opt, labels, annotations)
 
-	if len(opt.Tolerations) > 0 {
-		d.Spec.Template.Spec.Tolerations = opt.Tolerations
-	}
-
-	if opt.RequestsCPU != "" {
-		reqCPU, err := resource.ParseQuantity(opt.RequestsCPU)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] = reqCPU
-	}
-
-	if opt.RequestsMemory != "" {
-		reqMemory, err := resource.ParseQuantity(opt.RequestsMemory)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = reqMemory
-	}
-
-	if opt.LimitsCPU != "" {
-		limCPU, err := resource.ParseQuantity(opt.LimitsCPU)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = limCPU
-	}
-
-	if opt.LimitsMemory != "" {
-		limMemory, err := resource.ParseQuantity(opt.LimitsMemory)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = limMemory
-	}
-
-	return
+	deployment := appsv1.Deployment(opt.Name, opt.Namespace).
+		WithLabels(labels).
+		WithAnnotations(annotations).
+		WithSpec(appsv1.DeploymentSpec().
+			WithReplicas(int32(opt.Replicas)).
+			WithSelector(metav1.LabelSelector().WithMatchLabels(labels)).
+			WithTemplate(corev1.PodTemplateSpec().
+				WithLabels(labels).
+				WithAnnotations(annotations).
+				WithSpec(podSpec(opt, volumes, mounts)),
+			),
+		)
+	return deployment, configMaps, nil
 }
 
-func NewStatefulSet(opt *DeploymentOpt) (d *appsv1.StatefulSet, c []*corev1.ConfigMap, err error) {
+const cacheVolumeName = "buildkit-cache"
+
+func NewStatefulSet(opt *DeploymentOpt) (*appsv1.StatefulSetApplyConfiguration, []*corev1.ConfigMapApplyConfiguration, error) {
 	labels := map[string]string{
 		"app": opt.Name,
 	}
 	annotations := map[string]string{}
-	replicas := int32(opt.Replicas)
-	privileged := true
-	args := opt.BuildkitFlags
-
-	volumeSize := resource.MustParse(defaultVolumeSize)
-	if opt.VolumeSize != "" {
-		volumeSize, err = resource.ParseQuantity(opt.VolumeSize)
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to parse volume size '%s'", opt.VolumeSize)
-		}
-	}
 
 	if len(opt.Platforms) > 0 {
 		annotations[AnnotationPlatform] = strings.Join(platformutil.Format(opt.Platforms), ",")
 	}
-
-	d = &appsv1.StatefulSet{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: appsv1.SchemeGroupVersion.String(),
-			Kind:       "StatefulSet",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:   opt.Namespace,
-			Name:        opt.Name,
-			Labels:      labels,
-			Annotations: annotations,
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels,
-					Annotations: annotations,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  containerName,
-							Image: opt.Image,
-							Args:  args,
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: &privileged,
-							},
-							ReadinessProbe: &corev1.Probe{
-								Handler: corev1.Handler{
-									Exec: &corev1.ExecAction{
-										Command: []string{"buildctl", "debug", "workers"},
-									},
-								},
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{},
-								Limits:   corev1.ResourceList{},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "cache",
-									MountPath: "/var/lib/buildkit",
-								},
-							},
-						},
-					},
-				},
-			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "cache",
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						StorageClassName: opt.VolumeStorageClassName,
-						AccessModes: []corev1.PersistentVolumeAccessMode{
-							corev1.ReadWriteOnce,
-						},
-						Resources: corev1.ResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: volumeSize,
-							},
-						},
-					},
-				},
-			},
-		},
+	if opt.Rootless {
+		annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
 	}
-	for _, cfg := range splitConfigFiles(opt.ConfigFiles) {
 
-		cc := &corev1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: corev1.SchemeGroupVersion.String(),
-				Kind:       "ConfigMap",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace:   opt.Namespace,
-				Name:        opt.Name + "-" + cfg.name,
-				Annotations: annotations,
-			},
-			Data: cfg.files,
-		}
-		d.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:      cfg.name,
-			MountPath: path.Join("/etc/buildkit", cfg.path),
-		}}
+	configMaps, volumes, mounts := configMaps(opt, labels, annotations)
 
-		d.Spec.Template.Spec.Volumes = []corev1.Volume{{
-			Name: "config",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: cc.Name,
-					},
-				},
-			},
-		}}
-		c = append(c, cc)
+	mounts = append(mounts, corev1.VolumeMount().
+		WithName(cacheVolumeName).
+		WithMountPath("/var/lib/buildkit"))
+
+	if opt.VolumeSize.Value() == 0 {
+		opt.VolumeSize = resource.MustParse(defaultVolumeSize)
 	}
+
+	if opt.VolumeStorageClassName == "" {
+		opt.VolumeStorageClassName = defaultVolumeStorageClassName
+	}
+
+	statefulset := appsv1.StatefulSet(opt.Name, opt.Namespace).
+		WithLabels(labels).
+		WithAnnotations(annotations).
+		WithSpec(appsv1.StatefulSetSpec().
+			WithReplicas(int32(opt.Replicas)).
+			WithSelector(metav1.LabelSelector().WithMatchLabels(labels)).
+			WithTemplate(corev1.PodTemplateSpec().
+				WithLabels(labels).
+				WithAnnotations(annotations).
+				WithSpec(podSpec(opt, volumes, mounts)),
+			).
+			WithVolumeClaimTemplates(corev1.PersistentVolumeClaim(cacheVolumeName, "").
+				WithLabels(labels).
+				WithSpec(corev1.PersistentVolumeClaimSpec().
+					WithAccessModes(kv1.ReadWriteOnce).
+					WithStorageClassName(opt.VolumeStorageClassName).
+					WithResources(corev1.ResourceRequirements().
+						WithRequests(kv1.ResourceList{kv1.ResourceStorage: opt.VolumeSize}),
+					),
+				),
+			),
+		)
+
+	fmt.Println("look at me ", statefulset)
+	return statefulset, configMaps, nil
+}
+
+func configMaps(opt *DeploymentOpt, labels, annotations map[string]string) ([]*corev1.ConfigMapApplyConfiguration, []*corev1.VolumeApplyConfiguration, []*corev1.VolumeMountApplyConfiguration) {
+	configs := splitConfigFiles(opt.ConfigFiles)
+	configMaps := make([]*corev1.ConfigMapApplyConfiguration, len(configs))
+	volumes := make([]*corev1.VolumeApplyConfiguration, len(configs))
+	mounts := make([]*corev1.VolumeMountApplyConfiguration, len(configs))
+	for i, cfg := range splitConfigFiles(opt.ConfigFiles) {
+		name := fmt.Sprintf("%s-%s", opt.Name, cfg.name)
+		configMaps[i] = corev1.ConfigMap(name, opt.Namespace).
+			WithLabels(labels).
+			WithAnnotations(annotations).
+			WithData(cfg.files)
+
+		volumes[i] = corev1.Volume().
+			WithName(name).
+			WithConfigMap(corev1.ConfigMapVolumeSource().
+				WithName(name),
+			)
+
+		mounts[i] = corev1.VolumeMount().
+			WithName(name).
+			WithMountPath(path.Join("/etc/buildkit", cfg.path))
+	}
+	return configMaps, volumes, mounts
+}
+
+func podSpec(opt *DeploymentOpt, volumes []*corev1.VolumeApplyConfiguration, volumeMounts []*corev1.VolumeMountApplyConfiguration) *corev1.PodSpecApplyConfiguration {
+	args := append(opt.BuildkitFlags, fmt.Sprintf("--oci-worker-no-process-sandbox=%v", opt.Rootless))
+
+	seccompProfileType := kv1.SeccompProfileTypeRuntimeDefault
+	if opt.Rootless {
+		seccompProfileType = kv1.SeccompProfileTypeUnconfined
+	}
+
+	initContainer := corev1.Container().
+		WithName("qemu").
+		WithImage(opt.Qemu.Image).
+		WithCommand("--install", "all").
+		WithSecurityContext(corev1.SecurityContext().
+			WithPrivileged(true),
+		)
+
+	container := corev1.Container().
+		WithName(containerName).
+		WithImage(opt.Image).
+		WithArgs(args...).
+		WithResources(corev1.ResourceRequirements().
+			WithRequests(kv1.ResourceList{
+				kv1.ResourceCPU:    opt.RequestsCPU,
+				kv1.ResourceMemory: opt.RequestsMemory,
+			}).
+			WithLimits(kv1.ResourceList{
+				kv1.ResourceCPU:    opt.LimitsCPU,
+				kv1.ResourceMemory: opt.LimitsMemory,
+			}),
+		).
+		WithSecurityContext(corev1.SecurityContext().
+			WithPrivileged(!opt.Rootless).
+			WithSeccompProfile(corev1.SeccompProfile().WithType(seccompProfileType)),
+		).
+		WithReadinessProbe(corev1.Probe().
+			WithExec(corev1.ExecAction().WithCommand("buildctl", "debug", "workers")),
+		)
+
+	container = container.WithVolumeMounts(volumeMounts...)
+
+	podSpec := corev1.PodSpec().
+		WithContainers(container).
+		WithNodeSelector(opt.NodeSelector).
+		WithTolerations(opt.Tolerations...).
+		WithVolumes(volumes...)
 
 	if opt.Qemu.Install {
-		d.Spec.Template.Spec.InitContainers = []corev1.Container{
-			{
-				Name:  "qemu",
-				Image: opt.Qemu.Image,
-				Args:  []string{"--install", "all"},
-				SecurityContext: &corev1.SecurityContext{
-					Privileged: &privileged,
-				},
-			},
-		}
+		podSpec = podSpec.WithInitContainers(initContainer)
 	}
 
-	if opt.Rootless {
-		if err := toRootlessSts(d); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	if len(opt.NodeSelector) > 0 {
-		d.Spec.Template.Spec.NodeSelector = opt.NodeSelector
-	}
-
-	if len(opt.Tolerations) > 0 {
-		d.Spec.Template.Spec.Tolerations = opt.Tolerations
-	}
-
-	if opt.RequestsCPU != "" {
-		reqCPU, err := resource.ParseQuantity(opt.RequestsCPU)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU] = reqCPU
-	}
-
-	if opt.RequestsMemory != "" {
-		reqMemory, err := resource.ParseQuantity(opt.RequestsMemory)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = reqMemory
-	}
-
-	if opt.LimitsCPU != "" {
-		limCPU, err := resource.ParseQuantity(opt.LimitsCPU)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = limCPU
-	}
-
-	if opt.LimitsMemory != "" {
-		limMemory, err := resource.ParseQuantity(opt.LimitsMemory)
-		if err != nil {
-			return nil, nil, err
-		}
-		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = limMemory
-	}
-
-	return
-}
-
-func toRootless(d *appsv1.Deployment) error {
-	d.Spec.Template.Spec.Containers[0].Args = append(
-		d.Spec.Template.Spec.Containers[0].Args,
-		"--oci-worker-no-process-sandbox",
-	)
-	d.Spec.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeUnconfined,
-		},
-	}
-	if d.Spec.Template.ObjectMeta.Annotations == nil {
-		d.Spec.Template.ObjectMeta.Annotations = make(map[string]string, 1)
-	}
-	d.Spec.Template.ObjectMeta.Annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
-	return nil
-}
-
-func toRootlessSts(d *appsv1.StatefulSet) error {
-	d.Spec.Template.Spec.Containers[0].Args = append(
-		d.Spec.Template.Spec.Containers[0].Args,
-		"--oci-worker-no-process-sandbox",
-	)
-	d.Spec.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeUnconfined,
-		},
-	}
-	if d.Spec.Template.ObjectMeta.Annotations == nil {
-		d.Spec.Template.ObjectMeta.Annotations = make(map[string]string, 1)
-	}
-	d.Spec.Template.ObjectMeta.Annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
-	return nil
+	return podSpec
 }
 
 type config struct {

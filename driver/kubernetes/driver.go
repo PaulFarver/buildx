@@ -16,11 +16,14 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/tracing/detect"
 	"github.com/pkg/errors"
-	appsv1 "k8s.io/api/apps/v1"
+
+	// appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/client-go/applyconfigurations/core/v1"
+	applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
+	scalev1 "k8s.io/client-go/applyconfigurations/autoscaling/v1"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 	clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -41,9 +44,9 @@ type Driver struct {
 	factory           driver.Factory
 	minReplicas       int
 	controller        string
-	deployment        *appsv1.Deployment
-	statefulset       *appsv1.StatefulSet
-	configMaps        []*corev1.ConfigMap
+	deployment        *applyappsv1.DeploymentApplyConfiguration
+	statefulset       *applyappsv1.StatefulSetApplyConfiguration
+	configMaps        []*applycorev1.ConfigMapApplyConfiguration
 	clientset         *kubernetes.Clientset
 	deploymentClient  clientappsv1.DeploymentInterface
 	statefulsetClient clientappsv1.StatefulSetInterface
@@ -64,59 +67,34 @@ func (d *Driver) Config() driver.InitConfig {
 func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 	return progress.Wrap("[internal] booting buildkit", l, func(sub progress.SubLogger) error {
 		for _, cm := range d.configMaps {
-			// Apply configuration
-			_, err := d.configMapClient.Create(ctx, cm, metav1.CreateOptions{})
-			if err != nil && !apierrors.IsAlreadyExists(err) {
-				return errors.Wrapf(err, "failed to create configmap %s", cm.Name)
+			// progress.Write(l, progress.("creating configmap %s", cm.Name))
+			_, err := d.configMapClient.Apply(ctx, cm, metav1.ApplyOptions{FieldManager: "buildx"})
+			if err != nil {
+				return errors.Wrapf(err, "failed to create configmap '%s'", cm.Name)
 			}
-			d.configMapClient.Update(ctx, cm, metav1.UpdateOptions{})
 		}
+		sub.Log(2, []byte("creating deployment"))
 		switch d.controller {
 		case "deployment":
-			_, err := d.deploymentClient.Create(ctx, d.deployment, metav1.CreateOptions{})
-			if err != nil && !apierrors.IsAlreadyExists(err) {
-				return errors.Wrap(err, "failed to create deployment")
+			_, err := d.deploymentClient.Apply(ctx, d.deployment, metav1.ApplyOptions{FieldManager: "buildx"})
+			if err != nil {
+				return errors.Wrap(err, "failed to apply deployment")
 			}
 		case "statefulset":
-			_, err := d.statefulsetClient.Create(ctx, d.statefulset, metav1.CreateOptions{})
-			if err != nil && !apierrors.IsAlreadyExists(err) {
-				return errors.Wrap(err, "failed to create statefulset")
+			_, err := d.statefulsetClient.Apply(ctx, d.statefulset, metav1.ApplyOptions{FieldManager: "buildx"})
+			if err != nil {
+				sub.Log(10, []byte(errors.Wrap(err, "failed to apply statefulset").Error()))
+				return errors.Wrap(err, "failed to apply statefulset")
 			}
+
+			// sub.Wrap("creating statefulset", func() error {
+			// 	_, err := d.statefulsetClient.Apply(ctx, d.statefulset, metav1.ApplyOptions{FieldManager: "buildx"})
+			// 	return err
+			// })
 		default:
+			sub.Log(34, []byte("HELP!"))
 			return errors.Errorf("unknown controller %s", d.controller)
 		}
-		// Look for a pod to use
-		// pod, err := d.podChooser.ChoosePod(ctx)
-		// if err != nil {
-		// If no pod exists, create the controller
-		// return err
-		// }
-		// _, err := d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
-		// if err != nil {
-		// 	if !apierrors.IsNotFound(err) {
-		// 		// If the deployment is found
-		// 		return errors.Wrapf(err, "error for bootstrap %q", d.deployment.Name)
-		// 	}
-
-		// 	for _, cfg := range d.configMaps {
-		// 		// create ConfigMap first if exists
-		// 		_, err = d.configMapClient.Create(ctx, cfg, metav1.CreateOptions{})
-		// 		if err != nil {
-		// 			if !apierrors.IsAlreadyExists(err) {
-		// 				return errors.Wrapf(err, "error while calling configMapClient.Create for %q", cfg.Name)
-		// 			}
-		// 			_, err = d.configMapClient.Update(ctx, cfg, metav1.UpdateOptions{})
-		// 			if err != nil {
-		// 				return errors.Wrapf(err, "error while calling configMapClient.Update for %q", cfg.Name)
-		// 			}
-		// 		}
-		// 	}
-
-		// 	_, err = d.deploymentClient.Create(ctx, d.deployment, metav1.CreateOptions{})
-		// 	if err != nil {
-		// 		return errors.Wrapf(err, "error while calling deploymentClient.Create for %q", d.deployment.Name)
-		// 	}
-		// }
 		return sub.Wrap(
 			fmt.Sprintf("waiting for %d pods to be ready", d.minReplicas),
 			func() error {
@@ -180,8 +158,12 @@ func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
 
 		dynNodes = append(dynNodes, node)
 	}
+	status := driver.Running
+	if len(dynNodes) == 0 {
+		status = driver.Stopped
+	}
 	return &driver.Info{
-		Status:       driver.Running,
+		Status:       status,
 		DynamicNodes: dynNodes,
 	}, nil
 }
@@ -192,6 +174,20 @@ func (d *Driver) Version(ctx context.Context) (string, error) {
 
 func (d *Driver) Stop(ctx context.Context, force bool) error {
 	// future version may scale the replicas to zero here
+	switch d.controller {
+	case "deployment":
+		_, err := d.deploymentClient.ApplyScale(ctx, *d.deployment.Name, scalev1.Scale().WithSpec(scalev1.ScaleSpec().WithReplicas(0)), metav1.ApplyOptions{FieldManager: "buildx"})
+		if err != nil {
+			return errors.Wrap(err, "failed to scale deployment")
+		}
+	case "statefulset":
+		_, err := d.statefulsetClient.ApplyScale(ctx, *d.statefulset.Name, scalev1.Scale().WithSpec(scalev1.ScaleSpec().WithReplicas(0)), metav1.ApplyOptions{FieldManager: "buildx"})
+		if err != nil {
+			return errors.Wrap(err, "failed to scale statefulset")
+		}
+	default:
+		return errors.Errorf("unknown controller %s", d.controller)
+	}
 	return nil
 }
 
@@ -200,13 +196,27 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 		return nil
 	}
 
-	if err := d.deploymentClient.Delete(ctx, d.deployment.Name, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "error while calling deploymentClient.Delete for %q", d.deployment.Name)
+	switch d.controller {
+	case "deployment":
+		err := d.deploymentClient.Delete(ctx, *d.deployment.Name, metav1.DeleteOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to delete deployment '%s'", *d.deployment.Name)
+			}
 		}
+	case "statefulset":
+		err := d.statefulsetClient.Delete(ctx, *d.statefulset.Name, metav1.DeleteOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to delete statefulset '%s'", *d.statefulset.Name)
+			}
+		}
+	default:
+		return errors.Errorf("unknown controller %s", d.controller)
 	}
+
 	for _, cfg := range d.configMaps {
-		if err := d.configMapClient.Delete(ctx, cfg.Name, metav1.DeleteOptions{}); err != nil {
+		if err := d.configMapClient.Delete(ctx, *cfg.Name, metav1.DeleteOptions{}); err != nil {
 			if !apierrors.IsNotFound(err) {
 				return errors.Wrapf(err, "error while calling configMapClient.Delete for %q", cfg.Name)
 			}
@@ -216,6 +226,7 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 }
 
 func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
+	fmt.Println("client")
 	restClient := d.clientset.CoreV1().RESTClient()
 	restClientConfig, err := d.KubeClientConfig.ClientConfig()
 	if err != nil {
@@ -223,6 +234,7 @@ func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
 	}
 	pod, err := d.podChooser.ChoosePod(ctx)
 	if err != nil {
+		fmt.Println("failed to choose pod", err)
 		return nil, err
 	}
 	if len(pod.Spec.Containers) == 0 {
