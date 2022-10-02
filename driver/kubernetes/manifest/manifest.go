@@ -9,6 +9,7 @@ import (
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	// corev1 "k8s.io/api/core/v1"
+	av1 "k8s.io/api/apps/v1"
 	kv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -126,6 +127,7 @@ func NewStatefulSet(opt *DeploymentOpt) (*appsv1.StatefulSetApplyConfiguration, 
 				WithAnnotations(annotations).
 				WithSpec(podSpec(opt, volumes, mounts)),
 			).
+			WithPodManagementPolicy(av1.ParallelPodManagement).
 			WithVolumeClaimTemplates(corev1.PersistentVolumeClaim(cacheVolumeName, "").
 				WithLabels(labels).
 				WithSpec(corev1.PersistentVolumeClaimSpec().
@@ -138,7 +140,6 @@ func NewStatefulSet(opt *DeploymentOpt) (*appsv1.StatefulSetApplyConfiguration, 
 			),
 		)
 
-	fmt.Println("look at me ", statefulset)
 	return statefulset, configMaps, nil
 }
 
