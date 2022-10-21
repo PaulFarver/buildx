@@ -16,33 +16,34 @@ inside your GitHub action pipelines, as long as your use case falls within the
 >
 > This cache storage backend requires using a different driver than the default
 > `docker` driver - see more information on selecting a driver
-> [here](../drivers/index.md). To create a new driver (which can act as a simple
-> drop-in replacement):
+> [here](https://docs.docker.com/build/building/drivers/). To create a new
+> driver (which can act as a simple drop-in replacement):
 >
 > ```console
-> docker buildx create --use --driver=docker-container
+> $ docker buildx create --use --driver=docker-container
 > ```
 
 ## Synopsis
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=gha[,parameters...] \
-  --cache-from type=gha[,parameters...]
+  --cache-from type=gha[,parameters...] .
 ```
 
-Common parameters:
+The following table describes the available CSV parameters that you can pass to
+`--cache-to` and `--cache-from`.
 
-- `url`: cache server URL (default `$ACTIONS_CACHE_URL`), see
-  [authentication](#authentication)
-- `token`: access token (default `$ACTIONS_RUNTIME_TOKEN`), see
-  [authentication](#authentication)
-- `scope`: cache scope (defaults to the name of the current Git branch).
+| Name    | Option                  | Type        | Default                         | Description                                  |
+| ------- | ----------------------- | ----------- | ------------------------------- | -------------------------------------------- |
+| `url`   | `cache-to`,`cache-from` | String      | `$ACTIONS_CACHE_URL`            | Cache server URL, see [authentication][1].   |
+| `token` | `cache-to`,`cache-from` | String      | `$ACTIONS_RUNTIME_TOKEN`        | Access token, see [authentication][1].       |
+| `scope` | `cache-to`,`cache-from` | String      | Name of the current Git branch. | Cache scope, see [scope][2]                  |
+| `mode`  | `cache-to`              | `min`,`max` | `min`                           | Cache layers to export, see [cache mode][3]. |
 
-Parameters for `--cache-to`:
-
-- `mode`: specify cache layers to export (default: `min`), see
-  [cache mode](./index.md#cache-mode)
+[1]: #authentication
+[2]: #scope
+[3]: index.md#cache-mode
 
 ## Authentication
 
@@ -66,12 +67,12 @@ example, the cache is set to a combination of the branch name and the image
 name, to ensure each branch gets its own cache):
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
-  --cache-to type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image
-  --cache-from type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image
-$ docker buildx build . --push -t <registry>/<image2> \
-  --cache-to type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image2
-  --cache-from type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image2
+$ docker buildx build --push -t <registry>/<image> \
+  --cache-to type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image \
+  --cache-from type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image .
+$ docker buildx build --push -t <registry>/<image2> \
+  --cache-to type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image2 \
+  --cache-from type=gha,url=...,token=...,scope=$GITHUB_REF_NAME-image2 .
 ```
 
 GitHub's
@@ -104,7 +105,7 @@ For example:
 ## Further reading
 
 For an introduction to caching see
-[Optimizing builds with cache management](https://docs.docker.com/build/building/cache).
+[Optimizing builds with cache](https://docs.docker.com/build/building/cache).
 
 For more information on the `gha` cache backend, see the
 [BuildKit README](https://github.com/moby/buildkit#github-actions-cache-experimental).

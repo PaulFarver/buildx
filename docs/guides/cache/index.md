@@ -12,54 +12,53 @@ important to keep the runtime of image builds as low as possible.
 >
 > If you use secrets or credentials inside your build process, ensure you
 > manipulate them using the dedicated
-> [--secret](../../reference/buildx_build.md#secret) functionality instead of
-> using manually `COPY`d files or build `ARG`s. Using manually managed secrets
-> like this with exported cache could lead to an information leak.
+> [`--secret` option](https://docs.docker.com/engine/reference/commandline/buildx_build/#secret).
+> Manually managing secrets using `COPY` or `ARG` could result in leaked
+> credentials.
 
 ## Backends
 
 Buildx supports the following cache storage backends:
 
-- [Inline cache](./inline.md) that embeds the build cache into the image.
+- `inline`: embeds the build cache into the image.
 
   The inline cache gets pushed to the same location as the main output result.
   Note that this only works for the `image` exporter.
 
-- [Registry cache](./registry.md) that embeds the build cache into a separate
-  image, and pushes to a dedicated location separate from the main output.
+- `registry`: embeds the build cache into a separate image, and pushes to a
+  dedicated location separate from the main output.
 
-- [Local directory cache](./local.md) that writes the build cache to a local
-  directory on the filesystem.
+- `local`: writes the build cache to a local directory on the filesystem.
 
-- [GitHub Actions cache](./gha.md) that uploads the build cache to
-  [GitHub](https://docs.github.com/en/rest/actions/cache) (beta).
+- `gha`: uploads the build cache to
+  [GitHub Actions cache](https://docs.github.com/en/rest/actions/cache) (beta).
 
-- [Amazon S3 cache](./s3.md) that uploads the build cache to an
+- `s3`: uploads the build cache to an
   [AWS S3 bucket](https://aws.amazon.com/s3/) (unreleased).
 
-- [Azure Blob Storage cache](./azblob.md) that uploads the build cache to
+- `azblob`: uploads the build cache to
   [Azure Blob Storage](https://azure.microsoft.com/en-us/services/storage/blobs/)
   (unreleased).
 
 ## Command syntax
 
 To use any of the cache backends, you first need to specify it on build with the
-[`--cache-to`](../../reference/buildx_build.md#cache-to) option to export the
-cache to your storage backend of choice. Then, use the
-[`--cache-from`](../../reference/buildx_build.md#cache-from) option to import
-the cache from the storage backend into the current build. Unlike the local
-BuildKit cache (which is always enabled), all of the cache storage backends must
-be explicitly exported to, and explicitly imported from. All cache exporters
-except for the `inline` cache requires that you
-[select an alternative Buildx driver](../drivers/index.md).
+[`--cache-to` option](https://docs.docker.com/engine/reference/commandline/buildx_build/#cache-to)
+to export the cache to your storage backend of choice. Then, use the
+[`--cache-from` option](https://docs.docker.com/engine/reference/commandline/buildx_build/#cache-from)
+to import the cache from the storage backend into the current build. Unlike the
+local BuildKit cache (which is always enabled), all of the cache storage
+backends must be explicitly exported to, and explicitly imported from. All cache
+exporters except for the `inline` cache requires that you
+[select an alternative Buildx driver](https://docs.docker.com/build/building/drivers/).
 
 Example `buildx` command using the `registry` backend, using import and export
 cache:
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=registry,ref=<registry>/<cache-image>[,parameters...] \
-  --cache-from type=registry,ref=<registry>/<cache-image>[,parameters...]
+  --cache-from type=registry,ref=<registry>/<cache-image>[,parameters...] .
 ```
 
 > **Warning**
@@ -79,10 +78,10 @@ following example shows importing cache from multiple locations using the
 registry cache backend:
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=registry,ref=<registry>/<cache-image>:<branch> \
   --cache-from type=registry,ref=<registry>/<cache-image>:<branch> \
-  --cache-from type=registry,ref=<registry>/<cache-image>:main
+  --cache-from type=registry,ref=<registry>/<cache-image>:main .
 ```
 
 ## Configuration options
@@ -110,9 +109,9 @@ Mode can be set to either of two options: `mode=min` or `mode=max`. For example,
 to build the cache with `mode=max` with the registry backend:
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=registry,ref=<registry>/<cache-image>,mode=max \
-  --cache-from type=registry,ref=<registry>/<cache-image>
+  --cache-from type=registry,ref=<registry>/<cache-image> .
 ```
 
 This option is only set when exporting a cache, using `--cache-to`. When
@@ -141,9 +140,9 @@ To select the compression algorithm, you can use the
 cache with `compression=zstd`:
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=registry,ref=<registry>/<cache-image>,compression=zstd \
-  --cache-from type=registry,ref=<registry>/<cache-image>
+  --cache-from type=registry,ref=<registry>/<cache-image> .
 ```
 
 Use the `compression-level=<value>` option alongside the `compression` parameter
@@ -173,9 +172,9 @@ images with Docker media types or with OCI media types. To export OCI media type
 cache, use the `oci-mediatypes` property:
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=registry,ref=<registry>/<cache-image>,oci-mediatypes=true \
-  --cache-from type=registry,ref=<registry>/<cache-image>
+  --cache-from type=registry,ref=<registry>/<cache-image> .
 ```
 
 This property is only meaningful with the `--cache-to` flag. When fetching

@@ -12,35 +12,33 @@ The `azblob` cache store uploads your resulting build cache to
 >
 > This cache storage backend requires using a different driver than the default
 > `docker` driver - see more information on selecting a driver
-> [here](../drivers/index.md). To create a new driver (which can act as a simple
-> drop-in replacement):
+> [here](https://docs.docker.com/build/building/drivers/). To create a new
+> driver (which can act as a simple drop-in replacement):
 >
 > ```console
-> docker buildx create --use --driver=docker-container
+> $ docker buildx create --use --driver=docker-container
 > ```
 
 ## Synopsis
 
 ```console
-$ docker buildx build . --push -t <registry>/<image> \
+$ docker buildx build --push -t <registry>/<image> \
   --cache-to type=azblob,name=<cache-image>[,parameters...] \
-  --cache-from type=azblob,name=<cache-image>[,parameters...]
+  --cache-from type=azblob,name=<cache-image>[,parameters...] .
 ```
 
-Common parameters:
+The following table describes the available CSV parameters that you can pass to
+`--cache-to` and `--cache-from`.
 
-- `name`: the name of the cache image.
-- `account_url`: the base address of the blob storage account, for example:
-  `https://myaccount.blob.core.windows.net`. See
-  [authentication](#authentication).
-- `secret_access_key`: specifies the
-  [Azure Blob Storage account key](https://docs.microsoft.com/en-us/azure/storage/common/storage-account-keys-manage),
-  see [authentication](#authentication).
+| Name                | Option                  | Type        | Default | Description                                        |
+| ------------------- | ----------------------- | ----------- | ------- | -------------------------------------------------- |
+| `name`              | `cache-to`,`cache-from` | String      |         | Required. The name of the cache image.             |
+| `account_url`       | `cache-to`,`cache-from` | String      |         | Base URL of the storage account.                   |
+| `secret_access_key` | `cache-to`,`cache-from` | String      |         | Blob storage account key, see [authentication][1]. |
+| `mode`              | `cache-to`              | `min`,`max` | `min`   | Cache layers to export, see [cache mode][2].       |
 
-Parameters for `--cache-to`:
-
-- `mode`: specify cache layers to export (default: `min`), see
-  [cache mode](./index.md#cache-mode)
+[1]: #authentication
+[2]: index.md#cache-mode
 
 ## Authentication
 
@@ -52,7 +50,7 @@ The environment variables are read from the server, not the Buildx client.
 ## Further reading
 
 For an introduction to caching see
-[Optimizing builds with cache management](https://docs.docker.com/build/building/cache).
+[Optimizing builds with cache](https://docs.docker.com/build/building/cache).
 
 For more information on the `azblob` cache backend, see the
 [BuildKit README](https://github.com/moby/buildkit#azure-blob-storage-cache-experimental).
