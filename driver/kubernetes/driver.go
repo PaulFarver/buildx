@@ -18,13 +18,15 @@ import (
 	"github.com/pkg/errors"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
-	scalev1 "k8s.io/client-go/applyconfigurations/autoscaling/v1"
+
+	// applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
+
+	// scalev1 "k8s.io/client-go/applyconfigurations/autoscaling/v1"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-	clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+
+	// clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
@@ -38,21 +40,28 @@ const (
 	LoadbalanceSticky = "sticky"
 )
 
+type Bootstrapper interface {
+	Apply(context.Context, metav1.ApplyOptions) error
+	Stop(context.Context) error
+	Rm(context.Context, metav1.DeleteOptions) error
+}
+
 type Driver struct {
 	driver.InitConfig
-	factory           driver.Factory
-	minReplicas       int
-	controller        string
-	deployment        *applyappsv1.DeploymentApplyConfiguration
-	statefulset       *applyappsv1.StatefulSetApplyConfiguration
-	configMaps        []*applycorev1.ConfigMapApplyConfiguration
-	clientset         *kubernetes.Clientset
-	deploymentClient  clientappsv1.DeploymentInterface
-	statefulsetClient clientappsv1.StatefulSetInterface
-	podClient         clientcorev1.PodInterface
-	configMapClient   clientcorev1.ConfigMapInterface
-	podChooser        podchooser.PodChooser
-	labelSelector     *metav1.LabelSelector
+	factory     driver.Factory
+	minReplicas int
+	controller  string
+	// deployment        *applyappsv1.DeploymentApplyConfiguration
+	// statefulset       *applyappsv1.StatefulSetApplyConfiguration
+	configMaps []*applycorev1.ConfigMapApplyConfiguration
+	clientset  *kubernetes.Clientset
+	// deploymentClient  clientappsv1.DeploymentInterface
+	// statefulsetClient clientappsv1.StatefulSetInterface
+	podClient       clientcorev1.PodInterface
+	configMapClient clientcorev1.ConfigMapInterface
+	podChooser      podchooser.PodChooser
+	labelSelector   *metav1.LabelSelector
+	applier         Bootstrapper
 }
 
 func (d *Driver) IsMobyDriver() bool {
@@ -65,37 +74,15 @@ func (d *Driver) Config() driver.InitConfig {
 
 func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 	return progress.Wrap("[internal] booting buildkit", l, func(sub progress.SubLogger) error {
-		for _, cm := range d.configMaps {
-			err := sub.Wrap("Applying configmap "+*cm.Name, func() error {
-				_, err := d.configMapClient.Apply(ctx, cm, metav1.ApplyOptions{FieldManager: "buildx"})
-				if err != nil {
-					return errors.Wrap(err, "failed to create configmap")
-				}
-				return nil
-			})
+		err := sub.Wrap("applying manifests", func() error {
+			err := d.applier.Apply(ctx, metav1.ApplyOptions{FieldManager: "buildx"})
 			if err != nil {
-				return err
+				return errors.Wrap(err, "failed to apply manifests")
 			}
-		}
-		switch d.controller {
-		case "deployment":
-			err := sub.Wrap("Applying deployment "+*d.deployment.Name, func() error {
-				_, err := d.deploymentClient.Apply(ctx, d.deployment, metav1.ApplyOptions{FieldManager: "buildx", Force: true})
-				return errors.Wrap(err, "failed to create deployment")
-			})
-			if err != nil {
-				return err
-			}
-		case "statefulset":
-			err := sub.Wrap("Applying statefulset "+*d.statefulset.Name, func() error {
-				_, err := d.statefulsetClient.Apply(ctx, d.statefulset, metav1.ApplyOptions{FieldManager: "buildx", Force: true})
-				return errors.Wrap(err, "failed to apply statefulset")
-			})
-			if err != nil {
-				return err
-			}
-		default:
-			return errors.Errorf("unknown controller %s", d.controller)
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		return sub.Wrap(
 			fmt.Sprintf("waiting for %d pods to be ready", d.minReplicas),
@@ -174,26 +161,11 @@ func (d *Driver) Version(ctx context.Context) (string, error) {
 }
 
 func (d *Driver) Stop(ctx context.Context, force bool) error {
-	// future version may scale the replicas to zero here
-	switch d.controller {
-	case "deployment":
-		_, err := d.deploymentClient.ApplyScale(ctx, *d.deployment.Name, scalev1.Scale().WithAPIVersion("autoscaling/v1").WithKind("Scale").WithSpec(scalev1.ScaleSpec().WithReplicas(0)), metav1.ApplyOptions{FieldManager: "buildx"})
-		if err != nil {
-			return errors.Wrap(err, "failed to scale deployment")
-		}
-	case "statefulset":
-		_, err := d.statefulsetClient.ApplyScale(ctx, *d.statefulset.Name, scalev1.Scale().
-			WithAPIVersion("autoscaling/v1").
-			WithKind("Scale").
-			WithSpec(scalev1.ScaleSpec().
-				WithReplicas(0),
-			), metav1.ApplyOptions{FieldManager: "buildx", Force: true})
-		if err != nil {
-			return errors.Wrap(err, "failed to scale statefulset")
-		}
-	default:
-		return errors.Errorf("unknown controller %s", d.controller)
+	err := d.applier.Stop(ctx)
+	if err != nil {
+		return errors.Wrap(err, "Failed to stop")
 	}
+
 	return nil
 }
 
@@ -202,32 +174,15 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 		return nil
 	}
 
-	switch d.controller {
-	case "deployment":
-		err := d.deploymentClient.Delete(ctx, *d.deployment.Name, metav1.DeleteOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to delete deployment '%s'", *d.deployment.Name)
-			}
-		}
-	case "statefulset":
-		err := d.statefulsetClient.Delete(ctx, *d.statefulset.Name, metav1.DeleteOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to delete statefulset '%s'", *d.statefulset.Name)
-			}
-		}
-	default:
-		return errors.Errorf("unknown controller %s", d.controller)
+	options := metav1.DeleteOptions{}
+	if force {
+		options = *metav1.NewDeleteOptions(0)
+	}
+	err := d.applier.Rm(ctx, options)
+	if err != nil {
+		return errors.Wrap(err, "Failed to remove")
 	}
 
-	for _, cfg := range d.configMaps {
-		if err := d.configMapClient.Delete(ctx, *cfg.Name, metav1.DeleteOptions{}); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "error while calling configMapClient.Delete for %q", cfg.Name)
-			}
-		}
-	}
 	return nil
 }
 

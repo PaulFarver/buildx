@@ -1,23 +1,28 @@
 package manifest
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"strings"
 
 	"github.com/docker/buildx/util/platformutil"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 
 	// corev1 "k8s.io/api/core/v1"
 	av1 "k8s.io/api/apps/v1"
 	kv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 
 	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	metav1core "k8s.io/apimachinery/pkg/apis/meta/v1"
 	appsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1 "k8s.io/client-go/applyconfigurations/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 type DeploymentOpt struct {
@@ -57,6 +62,84 @@ const (
 	defaultVolumeStorageClassName = "hostpath"
 )
 
+// type Bootstrapper interface {
+// 	Apply(context.Context, metav1core.ApplyOptions) error
+// 	Stop(context.Context) error
+// 	Rm(context.Context, metav1core.DeleteOptions) error
+// }
+
+type DeploymentApplier struct {
+	Deployment *appsv1.DeploymentApplyConfiguration
+	ConfigMaps []*corev1.ConfigMapApplyConfiguration
+	clientset  *kubernetes.Clientset
+	namespace  string
+}
+
+func (a *DeploymentApplier) Apply(ctx context.Context, opt metav1core.ApplyOptions) error {
+	cmClient := a.clientset.CoreV1().ConfigMaps(a.namespace)
+	for _, cm := range a.ConfigMaps {
+		_, err := cmClient.Apply(ctx, cm, opt)
+		if err != nil {
+			return errors.Wrap(err, "Failed to apply configmap")
+		}
+	}
+
+	_, err := a.clientset.AppsV1().Deployments(a.namespace).Apply(ctx, a.Deployment, opt)
+	if err != nil {
+		return errors.Wrap(err, "Failed to apply deployment")
+	}
+
+	return nil
+}
+
+func (a *DeploymentApplier) Stop(ctx context.Context) error {
+	// Scale down to 0
+	_, err := a.clientset.AppsV1().Deployments(a.namespace).Patch(ctx, *a.Deployment.Name, types.MergePatchType, []byte(`{"spec":{"replicas":0}}`), metav1core.PatchOptions{FieldManager: "buildx"})
+	if err != nil {
+		return errors.Wrap(err, "Failed to patch deployment")
+	}
+
+	return nil
+}
+
+func (a *DeploymentApplier) Rm(ctx context.Context, opt metav1core.DeleteOptions) error {
+	// Delete deployment and configmaps
+	err := a.clientset.AppsV1().Deployments(a.namespace).Delete(ctx, *a.Deployment.Name, opt)
+	if err != nil {
+		return errors.Wrap(err, "Failed to delete deployment")
+	}
+
+	cmClient := a.clientset.CoreV1().ConfigMaps(a.namespace)
+	for _, cm := range a.ConfigMaps {
+		err := cmClient.Delete(ctx, *cm.Name, opt)
+		if err != nil {
+			return errors.Wrap(err, "Failed to delete configmap")
+		}
+	}
+
+	return nil
+}
+
+func (a *DeploymentApplier) LabelSelector() *metav1core.LabelSelector {
+	return &metav1core.LabelSelector{
+		MatchLabels: a.Deployment.Spec.Selector.MatchLabels,
+	}
+}
+
+func NewDeploymentApplier(clientset *kubernetes.Clientset, namespace string, opt *DeploymentOpt) (*DeploymentApplier, error) {
+	dep, cms, err := NewDeployment(opt)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to build apply manifests")
+	}
+
+	return &DeploymentApplier{
+		Deployment: dep,
+		ConfigMaps: cms,
+		clientset:  clientset,
+		namespace:  namespace,
+	}, nil
+}
+
 func NewDeployment(opt *DeploymentOpt) (*appsv1.DeploymentApplyConfiguration, []*corev1.ConfigMapApplyConfiguration, error) {
 	labels := map[string]string{
 		"app": opt.Name,
@@ -88,6 +171,78 @@ func NewDeployment(opt *DeploymentOpt) (*appsv1.DeploymentApplyConfiguration, []
 }
 
 const cacheVolumeName = "buildkit-cache"
+
+type StatefulSetApplier struct {
+	StatefulSet *appsv1.StatefulSetApplyConfiguration
+	ConfigMaps  []*corev1.ConfigMapApplyConfiguration
+	clientset   *kubernetes.Clientset
+	namespace   string
+}
+
+func (a *StatefulSetApplier) Apply(ctx context.Context, opt metav1core.ApplyOptions) error {
+	cmClient := a.clientset.CoreV1().ConfigMaps(a.namespace)
+	for _, cm := range a.ConfigMaps {
+		_, err := cmClient.Apply(ctx, cm, opt)
+		if err != nil {
+			return errors.Wrap(err, "Failed to apply configmap")
+		}
+	}
+
+	_, err := a.clientset.AppsV1().StatefulSets(a.namespace).Apply(ctx, a.StatefulSet, opt)
+	if err != nil {
+		return errors.Wrap(err, "Failed to apply statefulset")
+	}
+
+	return nil
+}
+
+func (a *StatefulSetApplier) Stop(ctx context.Context) error {
+	// Scale down to 0
+	_, err := a.clientset.AppsV1().StatefulSets(a.namespace).Apply(ctx, a.StatefulSet.WithSpec(a.StatefulSet.Spec.WithReplicas(0)), metav1core.ApplyOptions{FieldManager: "buildx"})
+	if err != nil {
+		return errors.Wrap(err, "Failed to patch statefulset")
+	}
+
+	return nil
+}
+
+func (a *StatefulSetApplier) Rm(ctx context.Context, opt metav1core.DeleteOptions) error {
+	// Delete statefulset and configmaps
+	err := a.clientset.AppsV1().StatefulSets(a.namespace).Delete(ctx, *a.StatefulSet.Name, opt)
+	if err != nil {
+		return errors.Wrap(err, "Failed to delete statefulset")
+	}
+
+	cmClient := a.clientset.CoreV1().ConfigMaps(a.namespace)
+	for _, cm := range a.ConfigMaps {
+		err := cmClient.Delete(ctx, *cm.Name, opt)
+		if err != nil {
+			return errors.Wrap(err, "Failed to delete configmap")
+		}
+	}
+
+	return nil
+}
+
+func (a *StatefulSetApplier) LabelSelector() *metav1core.LabelSelector {
+	return &metav1core.LabelSelector{
+		MatchLabels: a.StatefulSet.Spec.Selector.MatchLabels,
+	}
+}
+
+func NewStatefulSetApplier(clientset *kubernetes.Clientset, namespace string, opt *DeploymentOpt) (*StatefulSetApplier, error) {
+	ss, cms, err := NewStatefulSet(opt)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to build apply manifests")
+	}
+
+	return &StatefulSetApplier{
+		StatefulSet: ss,
+		ConfigMaps:  cms,
+		clientset:   clientset,
+		namespace:   namespace,
+	}, nil
+}
 
 func NewStatefulSet(opt *DeploymentOpt) (*appsv1.StatefulSetApplyConfiguration, []*corev1.ConfigMapApplyConfiguration, error) {
 	labels := map[string]string{

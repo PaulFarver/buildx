@@ -7,7 +7,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 
 	"github.com/docker/buildx/driver"
@@ -84,37 +85,55 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	d.controller = controllerType
 	switch controllerType {
 	case "deployment":
-		deployment, configMaps, err := manifest.NewDeployment(deploymentOpt)
+		applier, err := manifest.NewDeploymentApplier(d.clientset, namespace, deploymentOpt)
 		if err != nil {
 			return nil, err
 		}
+		d.applier = applier
+		d.labelSelector = applier.LabelSelector()
 
-		d.configMaps = configMaps
-		d.minReplicas = deploymentOpt.Replicas
-		d.labelSelector = &metav1.LabelSelector{
-			MatchLabels: deployment.Spec.Selector.MatchLabels,
-		}
-
-		d.deployment = deployment
-
-		d.deploymentClient = clientset.AppsV1().Deployments(namespace)
 		break
+
+		// deployment, configMaps, err := manifest.NewDeployment(deploymentOpt)
+		// if err != nil {
+		// 	return nil, err
+		// }
+
+		// d.configMaps = configMaps
+		// d.minReplicas = deploymentOpt.Replicas
+		// d.labelSelector = &metav1.LabelSelector{
+		// 	MatchLabels: deployment.Spec.Selector.MatchLabels,
+		// }
+
+		// d.deployment = deployment
+
+		// d.deploymentClient = clientset.AppsV1().Deployments(namespace)
+		// break
 	case "statefulset":
-		statefulset, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
+		applier, err := manifest.NewStatefulSetApplier(d.clientset, namespace, deploymentOpt)
 		if err != nil {
 			return nil, err
 		}
+		d.applier = applier
+		d.labelSelector = applier.LabelSelector()
 
-		d.configMaps = configMaps
-		d.minReplicas = deploymentOpt.Replicas
-		d.labelSelector = &metav1.LabelSelector{
-			MatchLabels: statefulset.Spec.Selector.MatchLabels,
-		}
-
-		d.statefulset = statefulset
-
-		d.statefulsetClient = clientset.AppsV1().StatefulSets(namespace)
 		break
+
+		// statefulset, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
+		// if err != nil {
+		// 	return nil, err
+		// }
+
+		// d.configMaps = configMaps
+		// d.minReplicas = deploymentOpt.Replicas
+		// d.labelSelector = &metav1.LabelSelector{
+		// 	MatchLabels: statefulset.Spec.Selector.MatchLabels,
+		// }
+
+		// d.statefulset = statefulset
+
+		// d.statefulsetClient = clientset.AppsV1().StatefulSets(namespace)
+		// break
 	default:
 		return nil, errors.Errorf("unsupported controller type %s", controllerType)
 	}
