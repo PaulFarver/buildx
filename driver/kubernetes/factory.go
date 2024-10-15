@@ -16,6 +16,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -103,8 +105,7 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 			return nil, errors.Errorf("%s driver requires kubernetes API access", DriverName)
 		}
 	}
-
-	deploymentName, err := buildxNameToDeploymentName(cfg.Name)
+	k8sName, err := buildxNameToK8sName(cfg.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -128,36 +129,87 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 		clientset:    clientset,
 	}
 
-	deploymentOpt, loadbalance, namespace, defaultLoad, timeout, err := f.processDriverOpts(deploymentName, namespace, cfg)
+	deploymentOpt, loadbalance, namespace, defaultLoad, timeout, err := f.processDriverOpts(k8sName, namespace, cfg)
 	if nil != err {
 		return nil, err
 	}
 
 	d.defaultLoad = defaultLoad
 	d.timeout = timeout
+	controllerType, ok := d.DriverOpts["controller"]
+	if !ok {
+		controllerType = "Deployment"
+	}
+	d.controller = controllerType
+	switch controllerType {
+	case "deployment":
+		applier, err := manifest.NewDeploymentApplier(d.clientset, namespace, deploymentOpt)
+		if err != nil {
+			return nil, err
+		}
+		d.applier = applier
+		d.labelSelector = applier.LabelSelector()
 
-	d.deployment, d.configMaps, err = manifest.NewDeployment(deploymentOpt)
-	if err != nil {
-		return nil, err
+		break
+
+		// deployment, configMaps, err := manifest.NewDeployment(deploymentOpt)
+		// if err != nil {
+		// 	return nil, err
+		// }
+
+		// d.configMaps = configMaps
+		// d.minReplicas = deploymentOpt.Replicas
+		// d.labelSelector = &metav1.LabelSelector{
+		// 	MatchLabels: deployment.Spec.Selector.MatchLabels,
+		// }
+
+		// d.deployment = deployment
+
+		// d.deploymentClient = clientset.AppsV1().Deployments(namespace)
+		// break
+	case "statefulset":
+		applier, err := manifest.NewStatefulSetApplier(d.clientset, namespace, deploymentOpt)
+		if err != nil {
+			return nil, err
+		}
+		d.applier = applier
+		d.labelSelector = applier.LabelSelector()
+
+		break
+
+		// statefulset, configMaps, err := manifest.NewStatefulSet(deploymentOpt)
+		// if err != nil {
+		// 	return nil, err
+		// }
+
+		// d.configMaps = configMaps
+		// d.minReplicas = deploymentOpt.Replicas
+		// d.labelSelector = &metav1.LabelSelector{
+		// 	MatchLabels: statefulset.Spec.Selector.MatchLabels,
+		// }
+
+		// d.statefulset = statefulset
+
+		// d.statefulsetClient = clientset.AppsV1().StatefulSets(namespace)
+		// break
+	default:
+		return nil, errors.Errorf("unsupported controller type %s", controllerType)
 	}
 
-	d.minReplicas = deploymentOpt.Replicas
-
-	d.deploymentClient = clientset.AppsV1().Deployments(namespace)
 	d.podClient = clientset.CoreV1().Pods(namespace)
 	d.configMapClient = clientset.CoreV1().ConfigMaps(namespace)
 
 	switch loadbalance {
 	case LoadbalanceSticky:
 		d.podChooser = &podchooser.StickyPodChooser{
-			Key:        cfg.ContextPathHash,
-			PodClient:  d.podClient,
-			Deployment: d.deployment,
+			Key:       cfg.ContextPathHash,
+			PodClient: d.podClient,
+			Selector:  d.labelSelector,
 		}
 	case LoadbalanceRandom:
 		d.podChooser = &podchooser.RandomPodChooser{
-			PodClient:  d.podClient,
-			Deployment: d.deployment,
+			PodClient: d.podClient,
+			Selector:  d.labelSelector,
 		}
 	}
 	return d, nil
@@ -196,17 +248,41 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 				return nil, "", "", false, 0, err
 			}
 		case "requests.cpu":
-			deploymentOpt.RequestsCPU = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.RequestsCPU = r
 		case "requests.memory":
-			deploymentOpt.RequestsMemory = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.RequestsMemory = r
 		case "requests.ephemeral-storage":
-			deploymentOpt.RequestsEphemeralStorage = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.RequestsEphemeralStorage = r
 		case "limits.cpu":
-			deploymentOpt.LimitsCPU = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.LimitsCPU = r
 		case "limits.memory":
-			deploymentOpt.LimitsMemory = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.LimitsMemory = r
 		case "limits.ephemeral-storage":
-			deploymentOpt.LimitsEphemeralStorage = v
+			r, err := resource.ParseQuantity(v)
+			if err != nil {
+				return nil, "", "", false, 0, err
+			}
+			deploymentOpt.LimitsEphemeralStorage = r
 		case "rootless":
 			deploymentOpt.Rootless, err = strconv.ParseBool(v)
 			if err != nil {
@@ -236,31 +312,31 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 			}
 		case "tolerations":
 			ts := strings.Split(v, ";")
-			deploymentOpt.Tolerations = []corev1.Toleration{}
+			deploymentOpt.Tolerations = []*applycorev1.TolerationApplyConfiguration{}
+			// deploymentOpt.Tolerations = []corev1.Toleration{}
 			for i := range ts {
 				kvs := strings.Split(ts[i], ",")
 
-				t := corev1.Toleration{}
+				t := applycorev1.Toleration()
 
 				for j := range kvs {
 					kv := strings.Split(kvs[j], "=")
 					if len(kv) == 2 {
 						switch kv[0] {
 						case "key":
-							t.Key = kv[1]
+							t = t.WithKey(kv[1])
 						case "operator":
-							t.Operator = corev1.TolerationOperator(kv[1])
+							t = t.WithOperator(corev1.TolerationOperator(kv[1]))
 						case "value":
-							t.Value = kv[1]
+							t = t.WithValue(kv[1])
 						case "effect":
-							t.Effect = corev1.TaintEffect(kv[1])
+							t = t.WithEffect(corev1.TaintEffect(kv[1]))
 						case "tolerationSeconds":
-							c, err := strconv.Atoi(kv[1])
+							seconds, err := strconv.Atoi(kv[1])
 							if nil != err {
 								return nil, "", "", false, 0, err
 							}
-							c64 := int64(c)
-							t.TolerationSeconds = &c64
+							t = t.WithTolerationSeconds(int64(seconds))
 						default:
 							return nil, "", "", false, 0, errors.Errorf("invalid tolaration %q", v)
 						}
@@ -296,6 +372,8 @@ func (f *factory) processDriverOpts(deploymentName string, namespace string, cfg
 			if err != nil {
 				return nil, "", "", false, 0, errors.Wrap(err, "cannot parse timeout")
 			}
+		case "controller":
+			break
 		default:
 			return nil, "", "", false, 0, errors.Errorf("invalid driver option %s for driver %s", k, DriverName)
 		}
@@ -321,10 +399,10 @@ func (f *factory) AllowsInstances() bool {
 	return true
 }
 
-// buildxNameToDeploymentName converts buildx name to Kubernetes Deployment name.
+// buildxNameToK8sName converts buildx name to Kubernetes Deployment or Statefulset name.
 //
 // eg. "buildx_buildkit_loving_mendeleev0" -> "loving-mendeleev0"
-func buildxNameToDeploymentName(bx string) (string, error) {
+func buildxNameToK8sName(bx string) (string, error) {
 	// TODO: commands.util.go should not pass "buildx_buildkit_" prefix to drivers
 	s, err := driver.ParseBuilderName(bx)
 	if err != nil {

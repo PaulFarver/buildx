@@ -17,12 +17,17 @@ import (
 	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
-	appsv1 "k8s.io/api/apps/v1"
+
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	// applyappsv1 "k8s.io/client-go/applyconfigurations/apps/v1"
+
+	// scalev1 "k8s.io/client-go/applyconfigurations/autoscaling/v1"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-	clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
+
+	// clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
@@ -36,6 +41,12 @@ const (
 	LoadbalanceSticky = "sticky"
 )
 
+type Bootstrapper interface {
+	Apply(context.Context, metav1.ApplyOptions) error
+	Stop(context.Context) error
+	Rm(context.Context, metav1.DeleteOptions) error
+}
+
 type Driver struct {
 	driver.InitConfig
 	factory      driver.Factory
@@ -43,16 +54,21 @@ type Driver struct {
 
 	// if you add fields, remember to update docs:
 	// https://github.com/docker/docs/blob/main/content/build/drivers/kubernetes.md
-	minReplicas      int
-	deployment       *appsv1.Deployment
-	configMaps       []*corev1.ConfigMap
-	clientset        *kubernetes.Clientset
-	deploymentClient clientappsv1.DeploymentInterface
-	podClient        clientcorev1.PodInterface
-	configMapClient  clientcorev1.ConfigMapInterface
-	podChooser       podchooser.PodChooser
-	defaultLoad      bool
-	timeout          time.Duration
+	minReplicas int
+	controller  string
+	// deployment        *applyappsv1.DeploymentApplyConfiguration
+	// statefulset       *applyappsv1.StatefulSetApplyConfiguration
+	configMaps []*applycorev1.ConfigMapApplyConfiguration
+	clientset  *kubernetes.Clientset
+	// deploymentClient  clientappsv1.DeploymentInterface
+	// statefulsetClient clientappsv1.StatefulSetInterface
+	podClient       clientcorev1.PodInterface
+	configMapClient clientcorev1.ConfigMapInterface
+	podChooser      podchooser.PodChooser
+	labelSelector   *metav1.LabelSelector
+	applier         Bootstrapper
+	defaultLoad     bool
+	timeout         time.Duration
 }
 
 func (d *Driver) IsMobyDriver() bool {
@@ -65,30 +81,15 @@ func (d *Driver) Config() driver.InitConfig {
 
 func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 	return progress.Wrap("[internal] booting buildkit", l, func(sub progress.SubLogger) error {
-		_, err := d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "error for bootstrap %q", d.deployment.Name)
-			}
-
-			for _, cfg := range d.configMaps {
-				// create ConfigMap first if exists
-				_, err = d.configMapClient.Create(ctx, cfg, metav1.CreateOptions{})
-				if err != nil {
-					if !apierrors.IsAlreadyExists(err) {
-						return errors.Wrapf(err, "error while calling configMapClient.Create for %q", cfg.Name)
-					}
-					_, err = d.configMapClient.Update(ctx, cfg, metav1.UpdateOptions{})
-					if err != nil {
-						return errors.Wrapf(err, "error while calling configMapClient.Update for %q", cfg.Name)
-					}
-				}
-			}
-
-			_, err = d.deploymentClient.Create(ctx, d.deployment, metav1.CreateOptions{})
+		err := sub.Wrap("applying manifests", func() error {
+			err := d.applier.Apply(ctx, metav1.ApplyOptions{FieldManager: "buildx"})
 			if err != nil {
-				return errors.Wrapf(err, "error while calling deploymentClient.Create for %q", d.deployment.Name)
+				return errors.Wrap(err, "failed to apply manifests")
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		return sub.Wrap(
 			fmt.Sprintf("waiting for %d pods to be ready, timeout: %s", d.minReplicas, units.HumanDuration(d.timeout)),
@@ -99,48 +100,38 @@ func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 }
 
 func (d *Driver) wait(ctx context.Context) error {
-	// TODO: use watch API
-	var (
-		err  error
-		depl *appsv1.Deployment
-	)
-
 	timeoutChan := time.After(d.timeout)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	watcher, err := d.podClient.Watch(ctx, metav1.ListOptions{
+		LabelSelector: metav1.FormatLabelSelector(d.labelSelector),
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to watch pods")
+	}
+	defer watcher.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.Wrap(ctx.Err(), "context cancelled while watching pods")
 		case <-timeoutChan:
 			return err
-		case <-ticker.C:
-			depl, err = d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
-			if err == nil {
-				if depl.Status.ReadyReplicas >= int32(d.minReplicas) {
-					return nil
-				}
-				err = errors.Errorf("expected %d replicas to be ready, got %d", d.minReplicas, depl.Status.ReadyReplicas)
+		case event, ok := <-watcher.ResultChan():
+			if !ok {
+				return errors.New("watcher channel closed")
+			}
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				return errors.Errorf("unexpected object type %T", event.Object)
+			}
+			if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+				return nil
 			}
 		}
 	}
 }
 
 func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
-	depl, err := d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
-	if err != nil {
-		// TODO: return err if err != ErrNotFound
-		return &driver.Info{
-			Status: driver.Inactive,
-		}, nil
-	}
-	if depl.Status.ReadyReplicas <= 0 {
-		return &driver.Info{
-			Status: driver.Stopped,
-		}, nil
-	}
-	pods, err := podchooser.ListRunningPods(ctx, d.podClient, depl)
+	pods, err := podchooser.ListRunningPods(ctx, d.podClient, d.labelSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -162,8 +153,12 @@ func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
 
 		dynNodes = append(dynNodes, node)
 	}
+	status := driver.Running
+	if len(dynNodes) == 0 {
+		status = driver.Stopped
+	}
 	return &driver.Info{
-		Status:       driver.Running,
+		Status:       status,
 		DynamicNodes: dynNodes,
 	}, nil
 }
@@ -173,7 +168,11 @@ func (d *Driver) Version(ctx context.Context) (string, error) {
 }
 
 func (d *Driver) Stop(ctx context.Context, force bool) error {
-	// future version may scale the replicas to zero here
+	err := d.applier.Stop(ctx)
+	if err != nil {
+		return errors.Wrap(err, "Failed to stop")
+	}
+
 	return nil
 }
 
@@ -182,18 +181,15 @@ func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
 		return nil
 	}
 
-	if err := d.deploymentClient.Delete(ctx, d.deployment.Name, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "error while calling deploymentClient.Delete for %q", d.deployment.Name)
-		}
+	options := metav1.DeleteOptions{}
+	if force {
+		options = *metav1.NewDeleteOptions(0)
 	}
-	for _, cfg := range d.configMaps {
-		if err := d.configMapClient.Delete(ctx, cfg.Name, metav1.DeleteOptions{}); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "error while calling configMapClient.Delete for %q", cfg.Name)
-			}
-		}
+	err := d.applier.Rm(ctx, options)
+	if err != nil {
+		return errors.Wrap(err, "Failed to remove")
 	}
+
 	return nil
 }
 
@@ -205,7 +201,7 @@ func (d *Driver) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	pod, err := d.podChooser.ChoosePod(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to choose pod")
 	}
 	if len(pod.Spec.Containers) == 0 {
 		return nil, errors.Errorf("pod %s does not have any container", pod.Name)

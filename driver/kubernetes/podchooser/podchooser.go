@@ -9,7 +9,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
 	"github.com/sirupsen/logrus"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -22,11 +21,11 @@ type PodChooser interface {
 type RandomPodChooser struct {
 	RandSource rand.Source
 	PodClient  clientcorev1.PodInterface
-	Deployment *appsv1.Deployment
+	Selector   *metav1.LabelSelector
 }
 
 func (pc *RandomPodChooser) ChoosePod(ctx context.Context) (*corev1.Pod, error) {
-	pods, err := ListRunningPods(ctx, pc.PodClient, pc.Deployment)
+	pods, err := ListRunningPods(ctx, pc.PodClient, pc.Selector)
 	if err != nil {
 		return nil, err
 	}
@@ -44,13 +43,13 @@ func (pc *RandomPodChooser) ChoosePod(ctx context.Context) (*corev1.Pod, error) 
 }
 
 type StickyPodChooser struct {
-	Key        string
-	PodClient  clientcorev1.PodInterface
-	Deployment *appsv1.Deployment
+	Key       string
+	PodClient clientcorev1.PodInterface
+	Selector  *metav1.LabelSelector
 }
 
 func (pc *StickyPodChooser) ChoosePod(ctx context.Context) (*corev1.Pod, error) {
-	pods, err := ListRunningPods(ctx, pc.PodClient, pc.Deployment)
+	pods, err := ListRunningPods(ctx, pc.PodClient, pc.Selector)
 	if err != nil {
 		return nil, err
 	}
@@ -66,16 +65,16 @@ func (pc *StickyPodChooser) ChoosePod(ctx context.Context) (*corev1.Pod, error) 
 		// NOTREACHED
 		logrus.Errorf("no pod found for key %q", pc.Key)
 		rpc := &RandomPodChooser{
-			PodClient:  pc.PodClient,
-			Deployment: pc.Deployment,
+			PodClient: pc.PodClient,
+			Selector:  pc.Selector,
 		}
 		return rpc.ChoosePod(ctx)
 	}
 	return podMap[chosen], nil
 }
 
-func ListRunningPods(ctx context.Context, client clientcorev1.PodInterface, depl *appsv1.Deployment) ([]*corev1.Pod, error) {
-	selector, err := metav1.LabelSelectorAsSelector(depl.Spec.Selector)
+func ListRunningPods(ctx context.Context, client clientcorev1.PodInterface, matchSelector *metav1.LabelSelector) ([]*corev1.Pod, error) {
+	selector, err := metav1.LabelSelectorAsSelector(matchSelector)
 	if err != nil {
 		return nil, err
 	}
